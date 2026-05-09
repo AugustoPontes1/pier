@@ -1621,13 +1621,19 @@ def _register_job_endpoints(app: FastAPI, jobs_dir: Path) -> None:
             rows.values(),
             key=lambda row: (-mean(row_reward_totals.get(row.key, [])), row.label),
         )
-        sorted_columns = sorted(
-            columns.values(),
-            key=lambda column: (
-                -mean(column_reward_totals.get(column.key, [])),
-                column.label,
-            ),
-        )
+        if column_by == "dataset":
+            sorted_columns = sorted(
+                columns.values(),
+                key=lambda column: (column.label.lower(), column.key),
+            )
+        else:
+            sorted_columns = sorted(
+                columns.values(),
+                key=lambda column: (
+                    -mean(column_reward_totals.get(column.key, [])),
+                    column.label,
+                ),
+            )
 
         return JobHeatmapData(
             rows=sorted_rows,

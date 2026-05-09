@@ -18,6 +18,7 @@ import {
   ArrowUpFromLine,
   Database,
   FileText,
+  GripVertical,
   Layers,
   Search,
   Trash2,
@@ -108,12 +109,14 @@ import {
   fetchTasks,
   summarizeJob,
 } from "~/lib/api";
+import { JobScalingChart } from "~/components/job-scaling-chart";
 import { JobScatterChart } from "~/components/job-scatter-chart";
 import { JobSlopeChart } from "~/components/job-slope-chart";
 import { useDebouncedValue, useKeyboardTableNavigation } from "~/lib/hooks";
 import type { JobHeatmapTrialsFilter } from "~/lib/api";
 import type {
   JobHeatmapCell,
+  JobHeatmapColumn,
   JobHeatmapColumnBy,
   JobHeatmapData,
   JobHeatmapRowBy,
@@ -903,7 +906,7 @@ function HeatmapControls({
     <>
       <div className="col-span-2 relative">
         <Input
-          placeholder="Search heat map..."
+          placeholder="Filter tasks..."
           value={searchQuery}
           onChange={(e) => setSearchQuery(e.target.value || null)}
           size="lg"
@@ -984,6 +987,8 @@ function HeatmapAxisBar({
   setStat,
   trialsFilter,
   setTrialsFilter,
+  isColumnOrderCustom,
+  resetColumnOrder,
 }: {
   rowBy: JobHeatmapRowBy;
   setRowBy: (value: string | null) => void;
@@ -993,6 +998,8 @@ function HeatmapAxisBar({
   setStat: (value: string | null) => void;
   trialsFilter: JobHeatmapTrialsFilter;
   setTrialsFilter: (value: JobHeatmapTrialsFilter) => void;
+  isColumnOrderCustom: boolean;
+  resetColumnOrder: () => void;
 }) {
   const rowAxisLabel =
     rowBy === "agent"
@@ -1001,93 +1008,110 @@ function HeatmapAxisBar({
         ? "models"
         : "agent + model configs";
   const colAxisLabel = columnBy === "dataset" ? "datasets" : "tasks";
+  const colSortDescription =
+    isColumnOrderCustom
+      ? `custom ${colAxisLabel} order`
+      : columnBy === "dataset"
+        ? `${colAxisLabel} sorted alphabetically`
+        : `${colAxisLabel} sorted by avg reward across ${rowAxisLabel}`;
   return (
-    <div className="flex flex-wrap items-center gap-x-6 gap-y-2 border-b px-4 py-2.5">
-      <div className="flex items-center gap-2 text-xs">
-        <span className="text-muted-foreground">Rows</span>
-        <Select value={rowBy} onValueChange={(value) => setRowBy(value)}>
-          <SelectTrigger
-            size="sm"
-            className="h-7 border-0 bg-transparent px-2 text-xs shadow-none hover:bg-accent focus-visible:ring-0"
-          >
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="config">Agent + Model</SelectItem>
-            <SelectItem value="agent">Agent</SelectItem>
-            <SelectItem value="model">Model</SelectItem>
-          </SelectContent>
-        </Select>
-      </div>
-      <div className="flex items-center gap-2 text-xs">
-        <span className="text-muted-foreground">Columns</span>
-        <Select value={columnBy} onValueChange={(value) => setColumnBy(value)}>
-          <SelectTrigger
-            size="sm"
-            className="h-7 border-0 bg-transparent px-2 text-xs shadow-none hover:bg-accent focus-visible:ring-0"
-          >
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="task">Task</SelectItem>
-            <SelectItem value="dataset">Dataset</SelectItem>
-          </SelectContent>
-        </Select>
-      </div>
-      <div className="flex items-center gap-2 text-xs">
-        <span className="text-muted-foreground">Color by</span>
-        <Select value={stat} onValueChange={(value) => setStat(value)}>
-          <SelectTrigger
-            size="sm"
-            className="h-7 border-0 bg-transparent px-2 text-xs shadow-none hover:bg-accent focus-visible:ring-0"
-          >
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            {HEATMAP_STATS.map((option) => (
-              <SelectItem key={option.value} value={option.value}>
-                {option.label}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-      </div>
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <div className="flex items-center gap-2 text-xs">
-            <span className="text-muted-foreground">Show</span>
-            <Select
-              value={trialsFilter}
-              onValueChange={(value) =>
-                setTrialsFilter(value as JobHeatmapTrialsFilter)
-              }
+    <div className="flex flex-wrap items-center justify-between gap-3 border-b px-4 py-3 text-xs text-muted-foreground">
+      <span className="max-w-3xl">
+        {rowAxisLabel} sorted by avg reward across {colAxisLabel};{" "}
+        {colSortDescription}
+      </span>
+      <div className="flex flex-wrap items-center gap-3">
+        <div className="flex items-center gap-2">
+          <span>Rows</span>
+          <Select value={rowBy} onValueChange={(value) => setRowBy(value)}>
+            <SelectTrigger
+              size="sm"
+              className="h-7 border-0 bg-transparent px-2 text-xs text-foreground shadow-none hover:bg-accent focus-visible:ring-0"
             >
-              <SelectTrigger
-                size="sm"
-                className="h-7 border-0 bg-transparent px-2 text-xs shadow-none hover:bg-accent focus-visible:ring-0"
-              >
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">All trials</SelectItem>
-                <SelectItem value="non_errored">Exclude errored</SelectItem>
-                <SelectItem value="successful">
-                  Only successful (reward = 1)
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="config">Agent + Model</SelectItem>
+              <SelectItem value="agent">Agent</SelectItem>
+              <SelectItem value="model">Model</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+        <div className="flex items-center gap-2">
+          <span>Columns</span>
+          <Select value={columnBy} onValueChange={(value) => setColumnBy(value)}>
+            <SelectTrigger
+              size="sm"
+              className="h-7 border-0 bg-transparent px-2 text-xs text-foreground shadow-none hover:bg-accent focus-visible:ring-0"
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="task">Task</SelectItem>
+              <SelectItem value="dataset">Dataset</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+        <div className="flex items-center gap-2">
+          <span>Color by</span>
+          <Select value={stat} onValueChange={(value) => setStat(value)}>
+            <SelectTrigger
+              size="sm"
+              className="h-7 border-0 bg-transparent px-2 text-xs text-foreground shadow-none hover:bg-accent focus-visible:ring-0"
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {HEATMAP_STATS.map((option) => (
+                <SelectItem key={option.value} value={option.value}>
+                  {option.label}
                 </SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-        </TooltipTrigger>
-        <TooltipContent>
-          <p className="text-xs max-w-xs">
-            Errored trials count as 0 reward by default. Choose a filter to
-            drop them, or to keep only successful (reward {">="} 1) trials.
-          </p>
-        </TooltipContent>
-      </Tooltip>
-      <div className="ml-auto text-[11px] text-muted-foreground">
-        {rowAxisLabel} sorted by avg reward across {colAxisLabel}; {colAxisLabel}{" "}
-        sorted by avg reward across {rowAxisLabel}
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <div className="flex items-center gap-2">
+              <span>Show</span>
+              <Select
+                value={trialsFilter}
+                onValueChange={(value) =>
+                  setTrialsFilter(value as JobHeatmapTrialsFilter)
+                }
+              >
+                <SelectTrigger
+                  size="sm"
+                  className="h-7 border-0 bg-transparent px-2 text-xs text-foreground shadow-none hover:bg-accent focus-visible:ring-0"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All trials</SelectItem>
+                  <SelectItem value="non_errored">Exclude errored</SelectItem>
+                  <SelectItem value="successful">
+                    Only successful (reward = 1)
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </TooltipTrigger>
+          <TooltipContent>
+            <p className="text-xs max-w-xs">
+              Errored trials count as 0 reward by default. Choose a filter to
+              drop them, or to keep only successful (reward {">="} 1) trials.
+            </p>
+          </TooltipContent>
+        </Tooltip>
+        {isColumnOrderCustom && (
+          <button
+            type="button"
+            onClick={resetColumnOrder}
+            className="text-foreground underline-offset-2 hover:underline"
+          >
+            Reset order
+          </button>
+        )}
       </div>
     </div>
   );
@@ -1099,6 +1123,24 @@ const ROW_WIDTH_MIN = 80;
 const ROW_WIDTH_MAX = 800;
 const COL_HEIGHT_MIN = 40;
 const COL_HEIGHT_MAX = 600;
+
+function arraysEqual<T>(a: T[], b: T[]): boolean {
+  return a.length === b.length && a.every((value, index) => value === b[index]);
+}
+
+function reconcileColumnOrder(
+  currentOrder: string[],
+  defaultOrder: string[]
+): string[] {
+  if (defaultOrder.length === 0) return [];
+  if (currentOrder.length === 0) return defaultOrder;
+
+  const defaultKeys = new Set(defaultOrder);
+  const keptKeys = currentOrder.filter((key) => defaultKeys.has(key));
+  const keptKeySet = new Set(keptKeys);
+  const newKeys = defaultOrder.filter((key) => !keptKeySet.has(key));
+  return [...keptKeys, ...newKeys];
+}
 
 function readStoredSize(key: string): number | null {
   if (typeof window === "undefined") return null;
@@ -1171,6 +1213,45 @@ export function JobHeatmap({
     number | null
   >(() => readStoredSize(COL_HEIGHT_STORAGE_KEY));
   const [draggingKind, setDraggingKind] = useState<"row" | "col" | null>(null);
+  const [columnOrder, setColumnOrder] = useState<string[]>([]);
+  const [draggingColumnKey, setDraggingColumnKey] = useState<string | null>(
+    null
+  );
+
+  const defaultColumnOrder = useMemo(
+    () => data?.columns.map((column) => column.key) ?? [],
+    [data]
+  );
+
+  useEffect(() => {
+    setColumnOrder((currentOrder) => {
+      if (currentOrder.length === 0) return currentOrder;
+      const nextOrder = reconcileColumnOrder(currentOrder, defaultColumnOrder);
+      if (arraysEqual(nextOrder, defaultColumnOrder)) return [];
+      return arraysEqual(currentOrder, nextOrder) ? currentOrder : nextOrder;
+    });
+  }, [defaultColumnOrder]);
+
+  const effectiveColumnOrder = useMemo(
+    () =>
+      columnOrder.length > 0
+        ? reconcileColumnOrder(columnOrder, defaultColumnOrder)
+        : defaultColumnOrder,
+    [columnOrder, defaultColumnOrder]
+  );
+
+  const orderedColumns = useMemo(() => {
+    if (!data) return [];
+    const columnsByKey = new Map<string, JobHeatmapColumn>(
+      data.columns.map((column) => [column.key, column])
+    );
+    return effectiveColumnOrder
+      .map((key) => columnsByKey.get(key))
+      .filter((column): column is JobHeatmapColumn => !!column);
+  }, [data, effectiveColumnOrder]);
+  const isColumnOrderCustom =
+    columnOrder.length > 0 &&
+    !arraysEqual(effectiveColumnOrder, defaultColumnOrder);
 
   const rowLabelWidth = rowLabelWidthOverride ?? autoRowLabelWidth;
   const colHeaderHeight = colHeaderHeightOverride ?? autoColHeaderHeight;
@@ -1290,6 +1371,54 @@ export function JobHeatmap({
     } catch {}
   };
 
+  const moveColumnToTarget = (movingKey: string, targetKey: string) => {
+    if (movingKey === targetKey) return;
+    setColumnOrder((currentOrder) => {
+      const baseOrder = reconcileColumnOrder(currentOrder, defaultColumnOrder);
+      const movingIndex = baseOrder.indexOf(movingKey);
+      const targetIndex = baseOrder.indexOf(targetKey);
+      if (movingIndex < 0 || targetIndex < 0) return currentOrder;
+
+      const nextOrder = [...baseOrder];
+      const [moving] = nextOrder.splice(movingIndex, 1);
+      nextOrder.splice(targetIndex, 0, moving);
+      if (arraysEqual(nextOrder, defaultColumnOrder)) return [];
+      return arraysEqual(currentOrder, nextOrder) ? currentOrder : nextOrder;
+    });
+  };
+
+  const startColumnDrag = (
+    e: React.DragEvent<HTMLDivElement>,
+    columnKey: string
+  ) => {
+    setDraggingColumnKey(columnKey);
+    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.setData("text/plain", columnKey);
+  };
+
+  const allowColumnDrop = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+  };
+
+  const enterColumnDropTarget = (
+    e: React.DragEvent<HTMLDivElement>,
+    columnKey: string
+  ) => {
+    allowColumnDrop(e);
+    const movingKey =
+      draggingColumnKey || e.dataTransfer.getData("text/plain");
+    if (movingKey) moveColumnToTarget(movingKey, columnKey);
+  };
+
+  const endColumnDrag = () => {
+    setDraggingColumnKey(null);
+  };
+
+  const resetColumnOrder = () => {
+    setColumnOrder([]);
+  };
+
   const isBusy = isLoading || isFetching;
   const showStaleDim = isFetching && !!data;
 
@@ -1303,6 +1432,8 @@ export function JobHeatmap({
       setStat={setStat}
       trialsFilter={trialsFilter}
       setTrialsFilter={setTrialsFilter}
+      isColumnOrderCustom={isColumnOrderCustom}
+      resetColumnOrder={resetColumnOrder}
     />
   );
 
@@ -1357,17 +1488,28 @@ export function JobHeatmap({
         <div
           className="grid w-fit min-w-full border-r"
           style={{
-            gridTemplateColumns: `${rowLabelWidth}px repeat(${data.columns.length}, minmax(72px, max-content))`,
+            gridTemplateColumns: `${rowLabelWidth}px repeat(${orderedColumns.length}, minmax(72px, max-content))`,
           }}
         >
         <div className="sticky top-0 left-0 z-30 bg-background border-r border-b" />
-        {data.columns.map((column) => (
+        {orderedColumns.map((column) => (
           <Tooltip key={column.key}>
             <TooltipTrigger asChild>
               <div
-                className="sticky top-0 z-10 bg-background border-b border-r flex items-end justify-center overflow-hidden"
+                draggable
+                onDragStart={(e) => startColumnDrag(e, column.key)}
+                onDragOver={allowColumnDrop}
+                onDragEnter={(e) => enterColumnDropTarget(e, column.key)}
+                onDrop={endColumnDrag}
+                onDragEnd={endColumnDrag}
+                className={cn(
+                  "group/col sticky top-0 z-10 bg-background border-b border-r flex items-end justify-center overflow-hidden cursor-grab active:cursor-grabbing transition-colors",
+                  draggingColumnKey === column.key && "bg-accent/60"
+                )}
                 style={{ height: `${colHeaderHeight}px` }}
+                aria-label={`Drag ${column.label} to reorder columns`}
               >
+                <GripVertical className="absolute top-2 left-1/2 size-3 -translate-x-1/2 text-muted-foreground/50 opacity-0 transition-opacity group-hover/col:opacity-100 group-focus/col:opacity-100" />
                 <span
                   className="px-2 py-3 text-xs whitespace-nowrap text-muted-foreground"
                   style={{
@@ -1381,6 +1523,7 @@ export function JobHeatmap({
             </TooltipTrigger>
             <TooltipContent>
               <p className="text-xs">{column.label}</p>
+              <p className="text-xs text-muted-foreground">Drag to reorder</p>
             </TooltipContent>
           </Tooltip>
         ))}
@@ -1398,7 +1541,7 @@ export function JobHeatmap({
                 <p className="text-xs">{row.label}</p>
               </TooltipContent>
             </Tooltip>
-            {data.columns.map((column) => {
+            {orderedColumns.map((column) => {
               const cell = data.cells[row.key]?.[column.key];
               if (!cell) {
                 return (
@@ -1895,6 +2038,40 @@ export default function Job() {
     placeholderData: keepPreviousData,
   });
 
+  // Scaling tab needs the same per-config rows, but columns are individual
+  // tasks so the chart can place each task on the X axis by average task scale.
+  const {
+    data: scalingData,
+    isLoading: scalingLoading,
+    isPlaceholderData: scalingIsPlaceholder,
+  } = useQuery({
+    queryKey: [
+      "job-scaling",
+      jobName,
+      debouncedSearch,
+      agentFilter,
+      providerFilter,
+      modelFilter,
+      sourceFilter,
+      taskFilter,
+    ],
+    queryFn: () =>
+      fetchJobHeatmap(jobName!, {
+        search: debouncedSearch || undefined,
+        agents: agentFilter.length > 0 ? agentFilter : undefined,
+        providers: providerFilter.length > 0 ? providerFilter : undefined,
+        models: modelFilter.length > 0 ? modelFilter : undefined,
+        sources: sourceFilter.length > 0 ? sourceFilter : undefined,
+        tasks: taskFilter.length > 0 ? taskFilter : undefined,
+        rowBy: "config",
+        columnBy: "task",
+        trialsFilter: "non_errored",
+      }),
+    enabled: !!jobName && activeTab === "scaling",
+    refetchInterval: job?.finished_at ? false : 5000,
+    placeholderData: keepPreviousData,
+  });
+
   // Handle Escape to navigate back when not on Results tab
   // (Results tab handles Escape via useKeyboardTableNavigation)
   useHotkeys("escape", () => navigate("/"), {
@@ -2096,6 +2273,7 @@ export default function Job() {
             <TabsTrigger value="heatmap">Heat Map</TabsTrigger>
             <TabsTrigger value="cross-bench">Cross-Bench</TabsTrigger>
             <TabsTrigger value="scatter">Scatter</TabsTrigger>
+            <TabsTrigger value="scaling">Scaling</TabsTrigger>
             <TabsTrigger value="summary">Analysis</TabsTrigger>
           </TabsList>
           <div className="flex items-center gap-3 px-3 text-xs text-muted-foreground">
@@ -2405,6 +2583,35 @@ export default function Job() {
             data={slopeData}
             isLoading={slopeLoading}
             isFetching={slopeIsPlaceholder}
+          />
+        </TabsContent>
+        <TabsContent value="scaling">
+          <div className="grid grid-cols-7 -mb-px">
+            <HeatmapControls
+              searchQuery={searchQuery}
+              setSearchQuery={setSearchQuery}
+              agentOptions={agentOptions}
+              agentFilter={agentFilter}
+              setAgentFilter={setAgentFilter}
+              providerOptions={providerOptions}
+              providerFilter={providerFilter}
+              setProviderFilter={setProviderFilter}
+              modelOptions={modelOptions}
+              modelFilter={modelFilter}
+              setModelFilter={setModelFilter}
+              sourceOptions={sourceOptions}
+              sourceFilter={sourceFilter}
+              setSourceFilter={setSourceFilter}
+              taskOptions={taskOptions}
+              taskFilter={taskFilter}
+              setTaskFilter={setTaskFilter}
+            />
+          </div>
+          <JobScalingChart
+            jobName={jobName!}
+            data={scalingData}
+            isLoading={scalingLoading}
+            isFetching={scalingIsPlaceholder}
           />
         </TabsContent>
         <TabsContent value="summary">

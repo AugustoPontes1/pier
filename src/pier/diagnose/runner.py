@@ -255,14 +255,21 @@ class DiagnosticRunner:
         paths = DiagnosticPaths(self.diagnostic_dir / item.source_trial_name)
         cached = paths.result_path
         if not self.config.overwrite and cached.exists():
-            return DiagnosticItemResult.model_validate_json(
+            cached_result = DiagnosticItemResult.model_validate_json(
                 cached.read_text(encoding="utf-8")
             )
+            if self._should_reuse_cached_result(cached_result):
+                return cached_result
+
         if self.config.overwrite and paths.diagnostic_dir.exists():
             shutil.rmtree(paths.diagnostic_dir)
 
         trial = DiagnosticTrial(self.config, item, self.diagnostic_dir)
         return await trial.run()
+
+    @staticmethod
+    def _should_reuse_cached_result(result: DiagnosticItemResult) -> bool:
+        return result.exception_info is None and result.diagnostic_result is not None
 
     def _write_job_result(self, result: DiagnosticJobResult) -> None:
         (self.diagnostic_dir / "result.json").write_text(
