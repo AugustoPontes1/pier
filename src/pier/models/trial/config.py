@@ -75,7 +75,13 @@ class AgentConfig(BaseModel):
 class EnvironmentConfig(BaseModel):
     type: EnvironmentType | None = None
     import_path: str | None = None
-    force_build: bool = False
+    force_build: bool = Field(
+        default=False,
+        description=(
+            "Whether to force rebuild the environment. For local Docker builds, "
+            "this also disables Docker layer cache."
+        ),
+    )
     delete: bool = True
     cpu_enforcement_policy: ResourceMode = ResourceMode.AUTO
     memory_enforcement_policy: ResourceMode = ResourceMode.AUTO
