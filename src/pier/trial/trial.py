@@ -4,11 +4,11 @@ import json
 import logging
 import shlex
 import shutil
-import tarfile
 import traceback
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Awaitable, Callable
 
 from tenacity import (
     retry,
@@ -24,9 +24,17 @@ from pier.models.agent.context import AgentContext
 from pier.models.task.config import (
     EnvironmentConfig as TaskEnvironmentConfig,
 )
-from pier.models.task.config import MultiStepRewardStrategy, StepConfig
+from pier.models.task.config import (
+    MultiStepRewardStrategy,
+    StepConfig,
+    VerifierEnvironmentMode,
+)
 from pier.models.task.task import Task
-from pier.models.task.verifier_mode import resolve_effective_verifier_env_config
+from pier.models.task.verifier_mode import (
+    resolve_effective_verifier_env_config,
+    resolve_step_verifier_mode,
+    resolve_task_verifier_mode,
+)
 from pier.models.trial.config import (
     ArtifactConfig,
     ServiceVolumeConfig,
@@ -40,6 +48,7 @@ from pier.models.trial.result import (
     TrialResult,
 )
 from pier.models.verifier.result import VerifierResult
+from pier.trial.artifact_handler import ArtifactHandler
 from pier.trial.hooks import TrialEvent, TrialHookEvent
 from pier.trial.execution import (
     AgentSetupTimeoutError,
@@ -165,8 +174,6 @@ class Trial:
     """
 
     _AGENT_SETUP_TIMEOUT_SEC = 360.0
-    _ARTIFACT_TAR_PATH = "/tmp/.hb-artifact-snapshot.tar.gz"
-    _ARTIFACT_TAR_NAME = ".hb-artifact-snapshot.tar.gz"
 
     def __init__(self, config: TrialConfig, *, _task: Task | None = None):
         """Deprecated. Use ``await Trial.create(config)`` instead."""
@@ -179,6 +186,8 @@ class Trial:
         self.config = config
         self.job_id = config.job_id
         self._are_agent_logs_downloaded = False
+        self._are_artifacts_collected = False
+        self._is_agent_environment_stopped = False
 
         self._hooks: dict[TrialEvent, list[TrialHookCallback]] = {
             event: [] for event in TrialEvent
@@ -206,6 +215,7 @@ class Trial:
         )
         self._agent = self._execution.agent
         self._environment = self._execution.environment
+        self._init_artifact_handler()
 
         self._verifier_timeout_sec = min(
             config.verifier.override_timeout_sec
@@ -342,6 +352,7 @@ class Trial:
         *,
         step_cfg: StepConfig | None,
         verifier_env: dict[str, str] | None = None,
+        artifacts_dir: Path | None = None,
     ) -> VerifierResult:
         separate_env_config = resolve_effective_verifier_env_config(
             self._task.config,
@@ -364,6 +375,12 @@ class Trial:
             key=step_cfg.name if step_cfg is not None else "trial",
             step_cfg=step_cfg,
             verifier_env=verifier_env,
+            artifacts_dir=(
+                artifacts_dir
+                if artifacts_dir is not None
+                else self._trial_paths.artifacts_dir
+            ),
+            artifacts=step_cfg.artifacts if step_cfg is not None else None,
         )
 
     async def _verify_with_separate_environment(
@@ -373,6 +390,8 @@ class Trial:
         key: str,
         step_cfg: StepConfig | None,
         verifier_env: dict[str, str] | None,
+        artifacts_dir: Path,
+        artifacts: Sequence[str | ArtifactConfig] | None = None,
     ) -> VerifierResult:
         env = EnvironmentFactory.create_environment_from_config(
             config=self.config.environment,
@@ -394,11 +413,17 @@ class Trial:
         try:
             await env.start(force_build=False)
             env_paths = env.env_paths
-            await env.reset_dirs(
-                remove_dirs=[env_paths.verifier_dir],
-                create_dirs=[env_paths.verifier_dir],
-                chmod_dirs=[env_paths.verifier_dir],
+
+            await env.empty_dirs([env_paths.verifier_dir], chmod=True)
+
+            await self._artifact_handler.upload_artifacts(
+                env,
+                artifacts_dir=artifacts_dir,
+                source_artifacts_dir=self._environment.env_paths.artifacts_dir,
+                target_artifacts_dir=env_paths.artifacts_dir,
+                artifacts=artifacts,
             )
+
             verifier = Verifier(
                 task=self._task,
                 trial_paths=self._trial_paths,
@@ -447,22 +472,43 @@ class Trial:
         prefix = safe[: _MAX_VERIFIER_ENV_SESSION_ID_LEN - len(suffix)].rstrip("-._")
         return f"{prefix}{suffix}"
 
-    async def _cleanup_and_finalize(self) -> None:
+    def _init_artifact_handler(self) -> None:
+        self._artifact_handler = ArtifactHandler(
+            artifacts=[*self._task.config.artifacts, *self.config.artifacts],
+            logger=self._logger,
+        )
+
+    async def _stop_agent_environment(self, *, keep_images: bool = False) -> None:
+        # keep_images: a separate-mode verifier environment may build FROM the
+        # agent image (tests/Dockerfile), so the pre-verification stop must not
+        # `down --rmi` it — fatal for local-only images, a gratuitous re-pull
+        # for registry-backed ones.
+        if self._is_agent_environment_stopped:
+            return
+
         try:
             await asyncio.shield(
-                self._environment.stop(delete=self.config.environment.delete)
+                self._environment.stop(
+                    delete=self.config.environment.delete and not keep_images
+                )
             )
+            self._is_agent_environment_stopped = True
         except asyncio.CancelledError:
+            self._is_agent_environment_stopped = True
             logger.warning(
                 f"Cleanup interrupted for {self.config.trial_name}, "
                 "but environment stop is shielded and will complete"
             )
         except Exception as e:
+            self._is_agent_environment_stopped = True
             logger.warning(
                 f"Warning: Environment cleanup failed for {self.config.trial_name}: {e}"
             )
             if self.result.exception_info is None:
                 self.result.exception_info = ExceptionInfo.from_exception(e)
+
+    async def _cleanup_and_finalize(self) -> None:
+        await self._stop_agent_environment()
 
         self.result.finished_at = datetime.now(timezone.utc)
         self.result.n_agent_steps = self.result.agent_step_count()
@@ -598,9 +644,16 @@ class Trial:
         finally:
             step_result.agent_execution.finished_at = datetime.now(timezone.utc)
 
-    async def _verify_step(self, step_cfg: StepConfig, step_result: StepResult) -> None:
+    async def _verify_step(
+        self,
+        step_cfg: StepConfig,
+        step_result: StepResult,
+        *,
+        artifacts_dir: Path,
+    ) -> None:
         """Run verification for a single step, recording timing and exceptions."""
         env_paths = self._environment.env_paths
+        mode = resolve_step_verifier_mode(self._task.config, step_cfg)
         timeout = self._resolve_step_timeout(
             override=self.config.verifier.override_timeout_sec,
             default=(
@@ -615,16 +668,21 @@ class Trial:
         step_result.verifier = TimingInfo(started_at=datetime.now(timezone.utc))
         try:
             await self._invoke_hooks(TrialEvent.VERIFICATION_START)
-            await self._environment.reset_dirs(
-                remove_dirs=[env_paths.verifier_dir, env_paths.tests_dir],
-                create_dirs=[env_paths.verifier_dir, env_paths.tests_dir],
-                chmod_dirs=[env_paths.verifier_dir],
-            )
+            # Separate-mode verification runs in its own environment; the agent
+            # environment may already be stopped, so only reset its shared
+            # verifier/tests dirs when the verifier shares it.
+            if mode != VerifierEnvironmentMode.SEPARATE:
+                await self._environment.reset_dirs(
+                    remove_dirs=[env_paths.verifier_dir, env_paths.tests_dir],
+                    create_dirs=[env_paths.verifier_dir, env_paths.tests_dir],
+                    chmod_dirs=[env_paths.verifier_dir],
+                )
 
             step_result.verifier_result = await asyncio.wait_for(
                 self._verify_once(
                     step_cfg=step_cfg,
                     verifier_env=step_cfg.verifier.env or None,
+                    artifacts_dir=artifacts_dir,
                 ),
                 timeout=timeout,
             )
@@ -683,6 +741,20 @@ class Trial:
                     target_dir=self._trial_paths.agent_dir,
                 )
                 self._maybe_populate_agent_context(step_result.agent_result)
+                await self._run_pre_artifacts_script()
+                await self._maybe_upload_agent_logs()
+
+                # Collect artifacts from the agent environment before
+                # verification so a separate verifier environment can receive
+                # them.
+                artifacts_dir = await self._collect_step_artifacts(step_cfg)
+                mode = resolve_step_verifier_mode(self._task.config, step_cfg)
+
+                if (
+                    mode == VerifierEnvironmentMode.SEPARATE
+                    and i == len(steps) - 1
+                ):
+                    await self._stop_agent_environment(keep_images=True)
 
                 if not self.config.verifier.disable:
                     self._environment.default_user = (
@@ -690,15 +762,19 @@ class Trial:
                         if step_cfg.verifier.user is not None
                         else self._task.config.verifier.user
                     )
-                    await self._maybe_upload_agent_logs()
-                    await self._verify_step(step_cfg, step_result)
+                    await self._verify_step(
+                        step_cfg, step_result, artifacts_dir=artifacts_dir
+                    )
                     _relocate_dir_contents(
                         self._trial_paths.verifier_dir, step_verifier_dir
                     )
 
             _relocate_dir_contents(self._trial_paths.agent_dir, step_agent_dir)
 
-            await self._download_step_artifacts(step_cfg)
+            self._artifact_handler.move_dir_contents(
+                self._trial_paths.artifacts_dir,
+                self._trial_paths.step_artifacts_dir(step_name),
+            )
 
             if step_result.exception_info and not step_result.verifier_result:
                 self._logger.warning(
@@ -735,6 +811,38 @@ class Trial:
         # rmdir any that are now empty (safe: rmdir raises on non-empty).
         self._trial_paths.cleanup_empty_mount_dirs()
 
+    async def _run_pre_artifacts_script(self) -> None:
+        """Run the task's optional ``pre_artifacts.sh`` in the agent environment.
+
+        Runs after the agent finishes and immediately before artifact
+        collection so the task can materialize artifacts from the agent's work
+        (e.g. capture the change set as ``/logs/artifacts/model.patch`` for a
+        separate verifier). Failures are logged, not fatal: a missing or failed
+        capture simply yields no artifact, which downstream grading treats as
+        an empty submission.
+        """
+        script = self._task.paths.pre_artifacts_path
+        if not script.exists():
+            return
+        target = "/tmp/.pier-pre-artifacts.sh"
+        try:
+            await self._environment.upload_file(
+                source_path=script, target_path=target
+            )
+            result = await self._environment.exec(
+                command=f"bash {target}",
+                timeout_sec=300,
+            )
+            if result.return_code != 0:
+                self._logger.warning(
+                    f"pre_artifacts.sh exited {result.return_code}"
+                )
+        except Exception:
+            self._logger.warning(
+                "pre_artifacts.sh failed to run; continuing without it",
+                exc_info=True,
+            )
+
     async def _maybe_upload_agent_logs(self) -> None:
         """Upload locally-generated agent logs back to the environment.
 
@@ -754,206 +862,36 @@ class Trial:
         except Exception:
             self._logger.error("Failed to upload agent logs back to environment")
 
-    async def _download_dir_with_excludes(
-        self, source: str, target: Path, exclude: list[str]
-    ) -> None:
-        """Download a directory using tar to apply exclude patterns."""
-        exclude_flags = " ".join(
-            f"--exclude={shlex.quote(pattern)}" for pattern in exclude
-        )
-        tar_path = shlex.quote(self._ARTIFACT_TAR_PATH)
-        source_path = shlex.quote(source)
-
-        await self._environment.exec(
-            f"tar czf {tar_path} {exclude_flags} -C {source_path} .",
-            timeout_sec=120,
-            user="root",
-        )
-
-        local_tar = target / self._ARTIFACT_TAR_NAME
-        await self._environment.download_file(
-            source_path=self._ARTIFACT_TAR_PATH, target_path=local_tar
-        )
-
-        with tarfile.open(local_tar, "r:gz") as tf:
-            tf.extractall(path=target, filter="data")
-
-        local_tar.unlink(missing_ok=True)
-
-    async def _collect_artifacts_into(
-        self,
-        target_dir: Path,
-        *,
-        convention_source_is_mount: bool,
-        extra_artifacts: list[str | ArtifactConfig] | None = None,
-    ) -> None:
-        """Shared best-effort artifact collection.
-
-        Collects the convention directory (``/logs/artifacts/``) and any
-        config-driven artifact paths (``task.config.artifacts`` +
-        ``self.config.artifacts`` + ``extra_artifacts``) into ``target_dir``
-        and writes ``target_dir/manifest.json``.
-
-        The convention dir is handled one of three ways:
-
-        * ``convention_source_is_mount=True`` — used for **mounted + multi-step**.
-          Contents are already on the host at ``self._trial_paths.artifacts_dir``
-          via bind-mount, so we relocate them into ``target_dir`` to keep each
-          step's snapshot isolated.
-        * ``convention_source_is_mount=False`` and environment is **not mounted**
-          — download ``/logs/artifacts/`` from the container.
-        * ``convention_source_is_mount=False`` and environment **is** mounted
-          (single-step) — no-op. Files are already at ``target_dir`` via the
-          mount; manifest records nothing for the convention dir, matching
-          historical trial-level behavior.
-
-        Config-driven paths are always attempted, regardless of mount status.
-
-        Never raises — all failures are logged and recorded in the manifest.
-        """
-        target_dir.mkdir(parents=True, exist_ok=True)
-        manifest: list[dict[str, Any]] = []
-
-        # 1. Convention directory (/logs/artifacts/)
-        if convention_source_is_mount:
-            src = self._trial_paths.artifacts_dir
-            had_contents = src.exists() and any(src.iterdir())
-            if had_contents:
-                _relocate_dir_contents(src, target_dir)
-            manifest.append(
-                {
-                    "source": self._environment.env_paths.artifacts_dir.as_posix(),
-                    "destination": "artifacts",
-                    "type": "directory",
-                    "status": "ok" if had_contents else "empty",
-                }
-            )
-        elif not self._environment.capabilities.mounted:
-            try:
-                await self._environment.download_dir(
-                    source_dir=self._environment.env_paths.artifacts_dir.as_posix(),
-                    target_dir=target_dir,
-                )
-                manifest.append(
-                    {
-                        "source": self._environment.env_paths.artifacts_dir.as_posix(),
-                        "destination": "artifacts",
-                        "type": "directory",
-                        "status": "ok",
-                    }
-                )
-            except Exception:
-                self._logger.debug(
-                    "Convention artifacts dir not found or download failed (best-effort)"
-                )
-                manifest.append(
-                    {
-                        "source": self._environment.env_paths.artifacts_dir.as_posix(),
-                        "destination": "artifacts",
-                        "type": "directory",
-                        "status": "failed",
-                    }
-                )
-        # else: mounted + single-step — content already at target_dir via the
-        # mount; nothing to do and nothing to record (preserves historical
-        # trial-level behavior).
-
-        # 2. Config-driven paths (task-level then trial-level then step-level,
-        # always attempted)
-        all_artifacts: list[str | ArtifactConfig] = [
-            *self._task.config.artifacts,
-            *self.config.artifacts,
-            *(extra_artifacts or []),
-        ]
-        for artifact in all_artifacts:
-            # Normalize: str -> ArtifactConfig(source=str)
-            if isinstance(artifact, str):
-                artifact = ArtifactConfig(source=artifact)
-
-            source = artifact.source
-            dest_rel = artifact.destination or Path(source).name
-            target = target_dir / dest_rel
-
-            # Probe the environment to determine if source is a directory.
-            # Fall back to suffix heuristic if the probe fails.
-            is_dir: bool | None = None
-            try:
-                is_dir = await self._environment.is_dir(source, user="root")
-            except Exception:
-                is_dir = not Path(source).suffix
-
-            try:
-                if is_dir:
-                    target.mkdir(parents=True, exist_ok=True)
-                    if artifact.exclude:
-                        await self._download_dir_with_excludes(
-                            source, target, artifact.exclude
-                        )
-                    else:
-                        await self._environment.download_dir(
-                            source_dir=source, target_dir=target
-                        )
-                    manifest.append(
-                        {
-                            "source": source,
-                            "destination": f"artifacts/{dest_rel}",
-                            "type": "directory",
-                            "status": "ok",
-                        }
-                    )
-                else:
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    await self._environment.download_file(
-                        source_path=source, target_path=target
-                    )
-                    manifest.append(
-                        {
-                            "source": source,
-                            "destination": f"artifacts/{dest_rel}",
-                            "type": "file",
-                            "status": "ok",
-                        }
-                    )
-            except Exception:
-                self._logger.warning(
-                    f"Failed to download artifact '{source}' (best-effort)"
-                )
-                manifest.append(
-                    {
-                        "source": source,
-                        "destination": f"artifacts/{dest_rel}",
-                        "type": "directory" if is_dir else "file",
-                        "status": "failed",
-                    }
-                )
-
-        # 3. Write manifest if any entries were recorded
-        if manifest:
-            try:
-                (target_dir / "manifest.json").write_text(
-                    json.dumps(manifest, indent=2)
-                )
-            except Exception:
-                self._logger.warning("Failed to write artifacts manifest (best-effort)")
-
-    async def _download_step_artifacts(self, step: StepConfig) -> None:
-        """Collect artifacts for a single step into ``steps/{step.name}/artifacts/``."""
-        await self._collect_artifacts_into(
-            self._trial_paths.step_artifacts_dir(step.name),
-            convention_source_is_mount=self._environment.capabilities.mounted,
-            extra_artifacts=step.artifacts,
-        )
-
-    async def _download_artifacts(self) -> None:
+    async def _collect_artifacts(self) -> None:
         """Collect trial-level artifacts into ``trial_dir/artifacts/``.
 
         Only used for single-step trials; multi-step collects per-step via
-        ``_download_step_artifacts``.
+        ``_collect_step_artifacts``.
         """
-        await self._collect_artifacts_into(
+        if self._are_artifacts_collected:
+            return
+
+        await self._artifact_handler.download_artifacts(
+            self._environment,
             self._trial_paths.artifacts_dir,
-            convention_source_is_mount=False,
+            source_artifacts_dir=self._environment.env_paths.artifacts_dir,
         )
+        self._are_artifacts_collected = True
+
+    async def _collect_step_artifacts(self, step: StepConfig) -> Path:
+        """Collect artifacts for a single step before its verification pass."""
+        artifacts_dir = (
+            self._trial_paths.artifacts_dir
+            if self._environment.capabilities.mounted
+            else self._trial_paths.step_artifacts_dir(step.name)
+        )
+        await self._artifact_handler.download_artifacts(
+            self._environment,
+            artifacts_dir,
+            source_artifacts_dir=self._environment.env_paths.artifacts_dir,
+            artifacts=step.artifacts,
+        )
+        return artifacts_dir
 
     async def run(self) -> TrialResult:
         self._trial_paths.trial_dir.mkdir(parents=True, exist_ok=True)
@@ -1005,17 +943,26 @@ class Trial:
             finally:
                 self._environment.default_user = None
 
+            # Collect artifacts from the agent environment before verification
+            # so a separate verifier environment can receive them. Multi-step
+            # trials collect artifacts per-step inside _run_steps.
+            if not self._task.has_steps:
+                await self._run_pre_artifacts_script()
+                await self._maybe_upload_agent_logs()
+                await self._collect_artifacts()
+
+                if (
+                    resolve_task_verifier_mode(self._task.config)
+                    == VerifierEnvironmentMode.SEPARATE
+                ):
+                    await self._stop_agent_environment(keep_images=True)
+
             if not self.config.verifier.disable and not self._task.has_steps:
                 self._environment.default_user = self._task.config.verifier.user
                 try:
-                    await self._maybe_upload_agent_logs()
                     await self._run_verification()
                 finally:
                     self._environment.default_user = None
-
-            # Multi-step trials collect artifacts per-step inside _run_steps.
-            if not self._task.has_steps:
-                await self._download_artifacts()
 
         except asyncio.CancelledError as e:
             self._logger.debug(f"Trial {self.config.trial_name} cancelled")
@@ -1031,7 +978,7 @@ class Trial:
             )
             self._maybe_populate_agent_context(self.result.agent_result)
             if not self._task.has_steps:
-                await self._download_artifacts()
+                await self._collect_artifacts()
             await self._invoke_hooks(TrialEvent.CANCEL)
 
             raise e
@@ -1052,7 +999,7 @@ class Trial:
                 )
 
             if not self._task.has_steps:
-                await self._download_artifacts()
+                await self._collect_artifacts()
 
         finally:
             await self._cleanup_and_finalize()

@@ -1,6 +1,6 @@
 [project]
 name = "datacurve-pier"
-version = "0.2.1"
+version = "0.3.0"
 description = "A framework for running coding agents in sandboxed environments and keeping full trajectories for analysis."
 readme = "README.md"
 license = "Apache-2.0"
@@ -51,10 +51,17 @@ module-name = "pier"
 requires = ["uv_build>=0.8.4,<0.9.0"]
 build-backend = "uv_build"
 
+[tool.pytest.ini_options]
+asyncio_mode = "strict"
+pythonpath = ["src"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["pier"]
 
 
 [dependency-groups]
-dev = ["ruff>=0.5"]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.5",
+]

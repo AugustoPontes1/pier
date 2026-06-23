@@ -3,6 +3,7 @@ from pathlib import Path
 
 from pier.models.task.config import TaskConfig
 from pier.models.task.paths import TaskPaths
+from pier.models.task.verifier_mode import resolve_effective_verifier_env_config
 
 # Matches canary lines: HTML comments (<!-- ...canary... -->) or hash comments (# ...canary...)
 _CANARY_LINE_RE = re.compile(r"^(<!--.*canary.*-->|#.*canary.*)$", re.IGNORECASE)
@@ -82,6 +83,13 @@ class Task:
             instruction = self.paths.step_instruction_path(step_cfg.name)
             if not instruction.exists():
                 raise FileNotFoundError(f"Step instruction not found: {instruction}")
+
+            # Separate-verifier steps build their verification environment from
+            # tests/, so the test script may live only in the verifier image.
+            verifier_env = resolve_effective_verifier_env_config(self.config, step_cfg)
+            if verifier_env is not None:
+                continue
+
             step_test = self.paths.discovered_step_test_path_for(step_cfg.name, task_os)
             shared_test = self.paths.discovered_test_path_for(task_os)
             if step_test is None and shared_test is None:

@@ -1,11 +1,14 @@
 import asyncio
 import logging
 import shlex
+import tarfile
+import tempfile
 import time
+import uuid
 import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
-from pathlib import Path, PurePath
+from pathlib import Path, PurePath, PurePosixPath
 from typing import Literal
 
 from pydantic import BaseModel
@@ -28,6 +31,8 @@ from pier.utils.logger import logger as global_logger
 from pier.utils.scripts import quote_shell_arg
 
 EnvironmentPath = str | PurePath
+_TRANSFER_TAR_TEMPLATE = ".hb-transfer-{uuid}.tar.gz"
+_ENV_TRANSFER_TAR_DIR = PurePosixPath("/tmp")
 
 
 class HealthcheckError(RuntimeError):
@@ -313,6 +318,45 @@ class BaseEnvironment(ABC):
             command += f" && chmod 777 {chmod_args}"
         return command
 
+    def _empty_dirs_command(
+        self,
+        dirs: Sequence[EnvironmentPath],
+        *,
+        chmod: bool = True,
+    ) -> str:
+        """Build a shell command that empties directories without replacing roots."""
+        q = lambda p: quote_shell_arg(p, self.task_os)  # noqa: E731
+
+        if self.task_os == TaskOS.WINDOWS:
+            commands: list[str] = []
+            for path in dirs:
+                path_str = str(path).rstrip("\\/")
+                dir_probe = f"{path_str}\\NUL"
+                children = f"{path_str}\\*"
+                commands.extend(
+                    [
+                        f"if exist {q(path)} if not exist {q(dir_probe)} del /F /Q {q(path)}",
+                        f"if not exist {q(dir_probe)} mkdir {q(path)}",
+                        f"del /F /Q {q(children)} 2>NUL",
+                        f'for /D %I in ({q(children)}) do rmdir /S /Q "%I"',
+                    ]
+                )
+            return " & ".join(commands)
+
+        commands = []
+        for path in dirs:
+            quoted = q(path)
+            commands.extend(
+                [
+                    f"if [ -L {quoted} ] || {{ [ -e {quoted} ] && [ ! -d {quoted} ]; }}; then rm -rf {quoted}; fi",
+                    f"mkdir -p {quoted}",
+                    f"find {quoted} -mindepth 1 -maxdepth 1 -exec rm -rf -- {{}} +",
+                ]
+            )
+            if chmod:
+                commands.append(f"chmod 777 {quoted}")
+        return " && ".join(commands)
+
     def _reset_dirs_user(self) -> str | None:
         """Use root only where that user exists and chmod is meaningful."""
         if self.task_os == TaskOS.WINDOWS:
@@ -333,6 +377,20 @@ class BaseEnvironment(ABC):
                 create_dirs=create_dirs,
                 chmod_dirs=chmod_dirs,
             ),
+            user=self._reset_dirs_user(),
+        )
+
+    async def empty_dirs(
+        self,
+        dirs: Sequence[EnvironmentPath],
+        *,
+        chmod: bool = True,
+    ) -> ExecResult | None:
+        """Ensure directories exist and are empty without replacing directory roots."""
+        if not dirs:
+            return None
+        return await self.exec(
+            self._empty_dirs_command(dirs, chmod=chmod),
             user=self._reset_dirs_user(),
         )
 
@@ -541,6 +599,58 @@ class BaseEnvironment(ABC):
             source_dir: The path to the source directory in the environment.
             target_dir: The local path to which to copy the directory.
         """
+
+    async def download_dir_with_exclusions(
+        self,
+        *,
+        source_dir: str,
+        target_dir: Path | str,
+        exclude: list[str],
+    ) -> None:
+        """Download a directory through a temporary tar archive with excludes."""
+        target = Path(target_dir)
+        target.mkdir(parents=True, exist_ok=True)
+
+        exclude_flags = " ".join(
+            f"--exclude={shlex.quote(pattern)}" for pattern in exclude
+        )
+        env_tar_filename = _TRANSFER_TAR_TEMPLATE.format(uuid=uuid.uuid4())
+        env_tar_path = str(_ENV_TRANSFER_TAR_DIR / env_tar_filename)
+        source_path = shlex.quote(source_dir)
+
+        result = await self.exec(
+            f"tar czf {shlex.quote(env_tar_path)} {exclude_flags} -C {source_path} .",
+            timeout_sec=120,
+            user="root",
+        )
+        if result.return_code != 0:
+            output = result.stderr or result.stdout or "no output"
+            raise RuntimeError(
+                "Failed to create transfer archive for "
+                f"{source_dir!r} with code {result.return_code}: {output}"
+            )
+
+        with tempfile.TemporaryDirectory() as host_tmp_dir:
+            host_tar_path = Path(host_tmp_dir) / env_tar_filename
+            await self.download_file(
+                source_path=env_tar_path,
+                target_path=host_tar_path,
+            )
+
+            with tarfile.open(host_tar_path, "r:gz") as tf:
+                tf.extractall(path=target, filter="data")
+
+        cleanup_result = await self.exec(
+            f"rm -f {shlex.quote(env_tar_path)}",
+            timeout_sec=120,
+            user="root",
+        )
+        if cleanup_result.return_code != 0:
+            output = cleanup_result.stderr or cleanup_result.stdout or "no output"
+            self.logger.warning(
+                "Failed to remove transfer archive "
+                f"{env_tar_path!r} with code {cleanup_result.return_code}: {output}"
+            )
 
     @abstractmethod
     async def exec(
